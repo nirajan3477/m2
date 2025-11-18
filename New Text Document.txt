@@ -1,0 +1,498 @@
+import streamlit as st
+import numpy as np
+import matplotlib.pyplot as plt
+from mpl_toolkits.mplot3d import Axes3D
+import colorsys
+import io
+
+# --- 1. Constants and Physics Definitions ---
+h = 6.626e-34      # Planck's constant (J*s)
+m_e = 9.11e-31     # Mass of an electron (kg)
+eV = 1.602e-19     # Joules per electron-volt (J/eV)
+hc_eV_nm = 1240    # h*c in (eV * nm)
+epsilon_0 = 8.854e-12 # Permittivity of free space (F/m)
+e_charge = 1.602e-19  # Elementary charge (C)
+
+# --- *** UPDATED MATERIALS DICTIONARY *** ---
+# Added dielectric_const (epsilon_r) for Exciton calculation
+MATERIALS = {
+    "Gallium Arsenide (GaAs)": {
+        "me_star": 0.067 * m_e,
+        "mh_star": 0.51 * m_e,
+        "E_bulk_gap": 1.424, # eV
+        "dielectric_const": 12.9
+    },
+    "Cadmium Selenide (CdSe)": {
+        "me_star": 0.13 * m_e,
+        "mh_star": 0.45 * m_e,
+        "E_bulk_gap": 1.74, # eV
+        "dielectric_const": 9.3 # Average value
+    },
+    "Silicon (Si)": {
+        "me_star": 0.19 * m_e, # (light electron mass)
+        "mh_star": 0.537 * m_e,
+        "E_bulk_gap": 1.12, # eV
+        "dielectric_const": 11.7
+    }
+}
+
+# --- Image Paths ---
+BULK_MATERIAL_IMAGES = {
+    "Gallium Arsenide (GaAs)": "images/gaas.jpg",
+    "Cadmium Selenide (CdSe)": "images/cdse.jpg",
+    "Silicon (Si)": "images/si.jpg"
+}
+DEFAULT_BULK_COLOR_HEX = "#A0A0A0"
+
+# --- 2. Physics Calculation Functions ---
+def calculate_confinement_energies(Lx_nm, Ly_nm, Lz_nm, m_star, dimensionality):
+    """
+    Calculates *confinement* energies (E_n) for a given effective mass.
+    Returns list of levels and the ground state confinement energy.
+    """
+    Lx_m, Ly_m, Lz_m = Lx_nm * 1e-9, Ly_nm * 1e-9, Lz_nm * 1e-9
+    try:
+        constant_factor_J = (h**2) / (8 * m_star)
+        if constant_factor_J == float('inf'): raise ZeroDivisionError # Catch if m_star is zero
+    except ZeroDivisionError:
+        return [], 0
+        
+    constant_factor_eV = constant_factor_J / eV
+    energies = []
+    
+    if dimensionality == "Quantum Wire (1D Freedom)":
+        L_avg_m = (Ly_m + Lz_m) / 2.0
+        if L_avg_m == 0: return [], 0
+        E_factor = constant_factor_eV / (L_avg_m**2)
+        for n in range(1, 11): energies.append(((n,), (n**2) * E_factor))
+            
+    elif dimensionality == "Quantum Well (2D Freedom)":
+        L_avg_m = Lz_m
+        if L_avg_m == 0: return [], 0
+        E_factor = constant_factor_eV / (L_avg_m**2)
+        for nx in range(1, 7):
+            for ny in range(1, 7): energies.append(((nx, ny), (nx**2 + ny**2) * E_factor))
+                
+    elif dimensionality == "Quantum Dot (0D Freedom)":
+        if Lx_m == 0 or Ly_m == 0 or Lz_m == 0: return [], 0
+        for nx in range(1, 5):
+            for ny in range(1, 5):
+                for nz in range(1, 5):
+                    E = constant_factor_eV * ( (nx**2 / Lx_m**2) + (ny**2 / Ly_m**2) + (nz**2 / Lz_m**2) )
+                    energies.append(((nx, ny, nz), E))
+    
+    elif dimensionality == "Bulk (3D Freedom)":
+        return [], 0
+
+    energies.sort(key=lambda x: x[1])
+
+    unique_levels = []
+    seen_energies = set()
+    for q_numbers, E in energies:
+        if round(E, 8) not in seen_energies:
+            unique_levels.append((q_numbers, E))
+            seen_energies.add(round(E, 8))
+        if len(unique_levels) >= 6:
+            break
+            
+    ground_state_confinement = unique_levels[0][1] if unique_levels else 0
+    return unique_levels, ground_state_confinement
+
+# --- *** NEW FUNCTION: Exciton Binding Energy *** ---
+def calculate_exciton_binding(L_nm, epsilon_r):
+    """
+    Simplified calculation for exciton binding energy in a quantum dot.
+    Scales inversely with size and dielectric constant.
+    Using a common approximation: E_b ~ 1.8 * e^2 / (4 * pi * epsilon_0 * epsilon_r * R)
+    where R is the radius (approximated as L/2).
+    """
+    if L_nm <= 0 or epsilon_r <= 0: return 0
+    
+    R_m = (L_nm / 2.0) * 1e-9 # Approximate radius in meters
+    
+    # Coulomb energy calculation
+    binding_J = (1.8 * e_charge**2) / (4 * np.pi * epsilon_0 * epsilon_r * R_m)
+    binding_eV = binding_J / eV
+    
+    # Cap the binding energy (it doesn't go to infinity for very small dots)
+    # This is a heuristic cap, real physics is more complex.
+    return min(binding_eV, 0.5) # Max binding energy of 0.5 eV
+
+# --- 3. Visualization Functions ---
+
+def wavelength_to_rgb(wavelength_nm, gamma=0.8):
+    """ Converts a wavelength in nm to an RGB tuple (0-255). """
+    if wavelength_nm < 380: return (75, 0, 130) # UV
+    if wavelength_nm > 780: return (128, 0, 0) # IR
+    if 380 <= wavelength_nm < 440:
+        A = 0.3 + 0.7 * (wavelength_nm - 380) / (440 - 380)
+        R, G, B = ((-(wavelength_nm - 440) / (440 - 380)) * A)**gamma, 0.0, (1.0 * A)**gamma
+    elif 440 <= wavelength_nm < 490:
+        R, G, B = 0.0, ((wavelength_nm - 440) / (490 - 440))**gamma, 1.0
+    elif 490 <= wavelength_nm < 510:
+        R, G, B = 0.0, 1.0, (-(wavelength_nm - 510) / (510 - 490))**gamma
+    elif 510 <= wavelength_nm < 580:
+        R, G, B = ((wavelength_nm - 510) / (580 - 510))**gamma, 1.0, 0.0
+    elif 580 <= wavelength_nm < 645:
+        R, G, B = 1.0, (-(wavelength_nm - 645) / (645 - 580))**gamma, 0.0
+    elif 645 <= wavelength_nm <= 780:
+        A = 0.3 + 0.7 * (780 - wavelength_nm) / (780 - 645)
+        R, G, B = (1.0 * A)**gamma, 0.0, 0.0
+    else: R, G, B = 0.0, 0.0, 0.0
+    return (int(R * 255), int(G * 255), int(B * 255))
+
+def rgb_to_hex(rgb_tuple):
+    """Converts an RGB tuple (0-255) to a hex string."""
+    return '#%02x%02x%02x' % rgb_tuple
+
+def create_confinement_plot(dimensionality, color_hex, is_selected, Lx, Ly, Lz, material_name=None):
+    """ Creates a 3D matplotlib plot or displays an image. """
+    
+    if dimensionality == "Bulk (3D Freedom)":
+        try:
+            if material_name and material_name in BULK_MATERIAL_IMAGES:
+                img = plt.imread(BULK_MATERIAL_IMAGES[material_name]) 
+                fig, ax = plt.subplots(figsize=(5, 5))
+                ax.imshow(img)
+                ax.axis('off') 
+                ax.set_title(f"{material_name.split(' (')[0]} Bulk", color='white', fontsize=14)
+                
+                if is_selected: fig.patch.set_edgecolor('green'); fig.patch.set_linewidth(5)
+                fig.set_facecolor('#0E1117')
+                return fig 
+                
+        except Exception as e:
+            print(f"Warning: Failed loading bulk image {material_name}: {e}")
+            pass 
+    
+    fig = plt.figure(figsize=(5, 5))
+    if is_selected: fig.patch.set_edgecolor('green'); fig.patch.set_linewidth(5)
+    else: fig.patch.set_edgecolor('none')
+
+    ax = fig.add_subplot(111, projection='3d')
+    ax.set_facecolor('#0E1117'); fig.set_facecolor('#0E1117')
+    ax.set_xlim([0, 10]); ax.set_ylim([0, 10]); ax.set_zlim([0, 10])
+    ax.set_xlabel('X', color='white'); ax.set_ylabel('Y', color='white'); ax.set_zlabel('Z', color='white')
+    ax.set_xticks([]); ax.set_yticks([]); ax.set_zticks([])
+    ax.xaxis.line.set_color("gray"); ax.yaxis.line.set_color("gray"); ax.zaxis.line.set_color("gray")
+    ax.grid(False)
+
+    def draw_arrow(ax, start, end, color):
+        ax.quiver(start[0], start[1], start[2], end[0]-start[0], end[1]-start[1], end[2]-start[2],
+                  color=color, arrow_length_ratio=0.3, linewidth=3)
+    
+    object_color = color_hex 
+    object_alpha = 0.8 if dimensionality != "Bulk (3D Freedom)" else 0.3
+
+    if dimensionality == "Bulk (3D Freedom)": # Fallback
+        ax.bar3d(1, 1, 1, 8, 8, 8, color=DEFAULT_BULK_COLOR_HEX, alpha=0.3) 
+        draw_arrow(ax, (5, 5, 5), (9, 5, 5), 'green'); draw_arrow(ax, (5, 5, 5), (5, 9, 5), 'green'); draw_arrow(ax, (5, 5, 5), (5, 5, 9), 'green')
+    elif dimensionality == "Quantum Well (2D Freedom)":
+        ax.bar3d(1, 1, 4.5, 8, 8, 1, color=object_color, alpha=object_alpha) 
+        draw_arrow(ax, (5, 5, 5), (9, 5, 5), 'green'); draw_arrow(ax, (5, 5, 5), (5, 9, 5), 'green')
+        draw_arrow(ax, (5, 5, 8), (5, 5, 6), 'red'); draw_arrow(ax, (5, 5, 2), (5, 5, 4), 'red')
+    elif dimensionality == "Quantum Wire (1D Freedom)":
+        ax.bar3d(1, 4.5, 4.5, 8, 1, 1, color=object_color, alpha=object_alpha) 
+        draw_arrow(ax, (5, 5, 5), (9, 5, 5), 'green') 
+        draw_arrow(ax, (5, 8, 5), (5, 6, 5), 'red'); draw_arrow(ax, (5, 2, 5), (5, 4, 5), 'red')
+        draw_arrow(ax, (5, 5, 8), (5, 5, 6), 'red'); draw_arrow(ax, (5, 5, 2), (5, 5, 4), 'red')
+    elif dimensionality == "Quantum Dot (0D Freedom)":
+        L_max = max(Lx, Ly, Lz, 1) 
+        sx, sy, sz = 8 * Lx / L_max, 8 * Ly / L_max, 8 * Lz / L_max
+        px, py, pz = 5 - sx/2, 5 - sy/2, 5 - sz/2
+        ax.bar3d(px, py, pz, sx, sy, sz, color=object_color, alpha=object_alpha)
+        draw_arrow(ax, (8, 5, 5), (5 + sx/2, 5, 5), 'red'); draw_arrow(ax, (2, 5, 5), (5 - sx/2, 5, 5), 'red') 
+        draw_arrow(ax, (5, 8, 5), (5, 5 + sy/2, 5), 'red'); draw_arrow(ax, (5, 2, 5), (5, 5 - sy/2, 5), 'red') 
+        draw_arrow(ax, (5, 5, 8), (5, 5, 5 + sz/2), 'red'); draw_arrow(ax, (5, 5, 2), (5, 5, 5 - sz/2), 'red') 
+        
+    return fig
+
+def plot_electronic_structure(dim_choice, energy_levels, L_nm):
+    """ Plots the Density of States (DOS) for the electron conduction band. """
+    fig, ax = plt.subplots(figsize=(10, 6))
+    ax.set_facecolor('#0E1117'); fig.set_facecolor('#0E1117')
+    ax.set_ylabel("Electron Energy (eV)", fontsize=14, color='white')
+    ax.tick_params(axis='y', colors='white'); ax.tick_params(axis='x', colors='white')
+    ax.spines['bottom'].set_color('white'); ax.spines['left'].set_color('white')
+    
+    if dim_choice == "Bulk (3D Freedom)":
+        E = np.linspace(0.001, 1, 100); dos = np.sqrt(E) 
+        ax.plot(dos, E, color='blue', linewidth=3)
+        ax.set_xlabel("Density of States g(E)", fontsize=14, color='white')
+        ax.set_title("Continuous Density of States (Bulk)", fontsize=16, color='white')
+        ax.set_yticks(np.linspace(0, 1, 5)); ax.set_xticks([])
+        ax.fill_between(dos, E, color='blue', alpha=0.3)
+    elif dim_choice == "Quantum Well (2D Freedom)":
+        ax.set_xlabel("Density of States g(E)", fontsize=14, color='white')
+        ax.set_title(f"Staircase DOS (Quantum Well, L={L_nm:.1f}nm)", fontsize=16, color='white')
+        E_levels = [E for q_num, E in energy_levels]; E_levels = E_levels or [0]
+        plot_limit = E_levels[-1] * 1.2
+        energies = [0] + E_levels + [plot_limit]; dos_steps = [0] 
+        for i in range(1, len(energies)): dos_steps.append(i-1) 
+        ax.step(dos_steps, energies, where='post', color='blue', linewidth=3)
+        ax.set_ylim(0, plot_limit); ax.set_xlim(0, len(E_levels) * 1.1); ax.set_xticks([])
+    elif dim_choice == "Quantum Wire (1D Freedom)":
+        ax.set_xlabel("Density of States g(E)", fontsize=14, color='white')
+        ax.set_title(f"1D DOS (Quantum Wire, L={L_nm:.1f}nm)", fontsize=16, color='white')
+        E_levels = [E for q_num, E in energy_levels]; E_levels = E_levels or [0.1]
+        plot_limit = E_levels[-1] * 1.2; ax.set_ylim(0, plot_limit); ax.set_xlim(0, 10); ax.set_xticks([])
+        if len(E_levels) > 1: e_scale = (E_levels[1] - E_levels[0]) * 0.8
+        else: e_scale = plot_limit / 5
+        e_axis_rel = np.linspace(0.01, e_scale, 100); dos_shape = 1 / np.sqrt(e_axis_rel)
+        dos_shape = (dos_shape / np.max(dos_shape)) * 8 
+        for E_n in E_levels:
+            if E_n < plot_limit:
+                ax.plot(dos_shape, E_n + e_axis_rel, color='blue', linewidth=3)
+                ax.hlines(E_n, 0, dos_shape[0], color='blue', linestyle='--', linewidth=2)
+                ax.text(dos_shape[0] + 0.2, E_n, f'n={energy_levels[E_levels.index(E_n)][0]}', va='center', color='white', fontsize=10)
+    elif dim_choice == "Quantum Dot (0D Freedom)": 
+        ax.set_title(f"0D DOS (Quantum Dot, L_avg={L_nm:.1f}nm)", fontsize=16, color='white')
+        ax.set_xticks([]); ax.set_xlim(0, 1.4); ax.set_xlabel("Discrete Energy Levels", fontsize=14, color='white')
+        if energy_levels:
+            max_E = energy_levels[-1][1]
+            for q_numbers, E in energy_levels:
+                q_str = f"n={q_numbers}"
+                ax.hlines(y=E, xmin=0, xmax=1, color='blue', linewidth=3)
+                ax.text(1.02, E, f' {q_str} ({E:.3f} eV)', va='center', fontsize=12, color='white')
+            ax.set_ylim(0, max_E * 1.2)
+        else:
+            ax.set_ylim(0, 1); ax.text(0.5, 0.5, "No levels found (E=0)", ha='center', color='white')
+        ax.grid(axis='y', linestyle='--', alpha=0.7)
+    return fig
+
+# --- *** UPDATED FUNCTION: Band Gap Plot *** ---
+def plot_band_gap_diagram(E_opt, E_elec, E_bind, E_bulk, E_conf_e, E_conf_h, color_hex):
+    """
+    Plots the final energy level diagram showing optical and electronic gaps.
+    """
+    fig, ax = plt.subplots(figsize=(4, 4))
+    ax.set_facecolor('#0E1117'); fig.set_facecolor('#0E1117')
+
+    # Define energy levels relative to valence band edge = 0
+    E_v_nano = 0
+    E_c_nano = E_elec # Top of electronic gap
+    E_bulk_v = E_conf_h # Bulk VB relative to nano VB
+    E_bulk_c = E_bulk + E_conf_h # Bulk CB relative to nano VB
+    
+    # Exciton level (slightly below CB)
+    E_exciton = E_c_nano - E_bind 
+
+    # Draw the nano bands
+    ax.hlines(E_v_nano, 0.1, 0.9, color='blue', linewidth=4, label='Valence Band (VB)')
+    ax.hlines(E_c_nano, 0.1, 0.9, color=color_hex, linewidth=4, label='Conduction Band (CB)')
+
+    # Draw the bulk bands (fainter)
+    ax.hlines(E_bulk_v, 0.1, 0.9, color='gray', linewidth=2, linestyle='--')
+    ax.hlines(E_bulk_c, 0.1, 0.9, color='gray', linewidth=2, linestyle='--')
+    
+    # Draw the exciton level
+    ax.hlines(E_exciton, 0.15, 0.85, color='yellow', linewidth=2, linestyle=':')
+
+    # Draw arrows for Optical Gap (VB to Exciton)
+    gap_mid = E_exciton / 2.0
+    ax.arrow(0.5, E_v_nano, 0, (E_exciton - E_v_nano) * 0.95, 
+             head_width=0.05, head_length=E_opt*0.05 if E_opt > 0 else 0.01, 
+             fc=color_hex, ec=color_hex, length_includes_head=True)
+    ax.arrow(0.5, E_exciton, 0, -(E_exciton - E_v_nano) * 0.95, 
+             head_width=0.05, head_length=E_opt*0.05 if E_opt > 0 else 0.01, 
+             fc=color_hex, ec=color_hex, length_includes_head=True)
+    
+    # Add text
+    ax.text(0.55, gap_mid, f'$E_{{opt}} = {E_opt:.3f}$ eV', ha='left', va='center', color='white', fontsize=12)
+    ax.text(0.95, E_c_nano, f' $E_c$ (Elec)', ha='left', va='center', color='white')
+    ax.text(0.95, E_v_nano, f' $E_v$ (Nano)', ha='left', va='center', color='white')
+    ax.text(0.95, E_bulk_c, f' $E_c$ (Bulk)', ha='left', va='center', color='gray', fontsize=9)
+    ax.text(0.95, E_bulk_v, f' $E_v$ (Bulk)', ha='left', va='center', color='gray', fontsize=9)
+    ax.text(0.87, E_exciton, f' Exciton', ha='right', va='center', color='yellow', fontsize=9)
+
+    ax.set_xlim(0, 1.5)
+    # Adjust ylim dynamically
+    plot_max = max(E_c_nano, E_bulk_c) * 1.1
+    plot_min = min(E_v_nano, E_bulk_v) - plot_max * 0.1 # Add padding below
+    ax.set_ylim(plot_min, plot_max)
+    ax.axis('off') # Clean look
+    ax.set_title("Band Gap Diagram", color='white')
+    return fig
+
+
+# --- 4. Streamlit App Layout ---
+
+st.set_page_config(layout="wide")
+st.title("🏆 Interactive Quantum Confinement Simulator")
+st.write("A project for **Nanoscience and Technology (17B1NPH732)** demonstrating how dimensionality and size impact a nanomaterial's electronic properties.")
+
+# --- Sidebar (User Controls) ---
+st.sidebar.header("Simulation Controls")
+
+dim_choice = st.sidebar.radio(
+    "Select Dimensionality (Degrees of Freedom)",
+    ["Bulk (3D Freedom)", 
+     "Quantum Well (2D Freedom)", 
+     "Quantum Wire (1D Freedom)", 
+     "Quantum Dot (0D Freedom)"],
+    index=3  # Default to Quantum Dot
+)
+
+mat_choice = st.sidebar.selectbox(
+    "Select Material (determines $m^*$)",
+    list(MATERIALS.keys())
+)
+
+L_MIN = 1.0
+L_MAX = 25.0
+
+if dim_choice == "Quantum Dot (0D Freedom)":
+    st.sidebar.markdown("---")
+    st.sidebar.subheader("Anisotropic Controls (Dot/Rod/Platelet)")
+    st.sidebar.write("Control the confinement in each dimension independently.")
+    Lx_nm = st.sidebar.slider(
+        "Size (Lx) in nm",
+        min_value=L_MIN, max_value=L_MAX, value=7.0, step=0.1
+    )
+    Ly_nm = st.sidebar.slider(
+        "Size (Ly) in nm",
+        min_value=L_MIN, max_value=L_MAX, value=7.0, step=0.1
+    )
+    Lz_nm = st.sidebar.slider(
+        "Size (Lz) in nm",
+        min_value=L_MIN, max_value=L_MAX, value=7.0, step=0.1
+    )
+    L_nm_avg = (Lx_nm + Ly_nm + Lz_nm) / 3.0
+else:
+    L_nm = st.sidebar.slider(
+        "Nanomaterial Size (L) in nm",
+        min_value=L_MIN, max_value=L_MAX, value=7.0, step=0.1
+    )
+    Lx_nm = L_nm; Ly_nm = L_nm; Lz_nm = L_nm
+    L_nm_avg = L_nm
+
+st.sidebar.markdown("---")
+st.sidebar.markdown("""
+### **How It Works:**
+1.  **Select Material:** Watch the "Bulk" image and bulk band gap change.
+2.  **Select Dimensionality:** Watch the "Electronic Structure" plot change shape.
+3.  **Adjust Size:** As **L** *decreases*, confinement increases, $E_{conf}$ increases, $E_b$ increases, pushing the total $E_{opt}$ larger and shifting color towards blue.
+""")
+
+# --- *** UPDATED CALCULATION LOGIC *** ---
+# 1. Get material properties
+mat_props = MATERIALS[mat_choice]
+me_star = mat_props["me_star"]
+mh_star = mat_props["mh_star"]
+E_bulk_gap = mat_props["E_bulk_gap"]
+epsilon_r = mat_props["dielectric_const"]
+
+# 2. Calculate confinement for electrons and holes
+electron_levels, E_conf_e = calculate_confinement_energies(Lx_nm, Ly_nm, Lz_nm, me_star, dim_choice)
+hole_levels, E_conf_h = calculate_confinement_energies(Lx_nm, Ly_nm, Lz_nm, mh_star, dim_choice)
+
+# 3. Calculate Exciton Binding Energy (using average size for simplicity)
+E_binding = calculate_exciton_binding(L_nm_avg, epsilon_r)
+
+# 4. Calculate Electronic and Optical Gaps
+if dim_choice == "Bulk (3D Freedom)":
+    E_gap_electronic = E_bulk_gap
+    E_gap_optical = E_bulk_gap # Binding energy is negligible in bulk
+    E_binding = 0 # Explicitly zero for bulk case
+else:
+    E_gap_electronic = E_bulk_gap + E_conf_e + E_conf_h
+    E_gap_optical = E_gap_electronic - E_binding
+
+# 5. Determine color from OPTICAL gap
+if E_gap_optical > 0:
+    wavelength_nm = hc_eV_nm / E_gap_optical
+    emitted_rgb = wavelength_to_rgb(wavelength_nm)
+    emitted_hex = rgb_to_hex(emitted_rgb)
+    if wavelength_nm < 380: color_name = "Ultraviolet (UV)"
+    elif wavelength_nm > 780: color_name = "Infrared (IR)"
+    else: color_name = "Visible"
+else:
+    wavelength_nm = float('inf'); emitted_rgb = (100, 100, 100); emitted_hex = "#646464"; color_name = "N/A"
+
+# --- Step-by-Step Dynamic Visualization (The "Why") ---
+st.markdown("---")
+st.header("🔬 Visualizing the Confinement Process (The 'Why')")
+st.write(f"This shows the step-by-step reduction in dimensionality, starting from the real bulk material. The nanostructures adapt their **color** ({emitted_hex}) based on the calculated *optical* band gap.")
+
+col1, col2, col3, col4 = st.columns(4)
+with col1:
+    st.subheader("Step 1: Bulk")
+    fig = create_confinement_plot("Bulk (3D Freedom)", emitted_hex, dim_choice == "Bulk (3D Freedom)", Lx_nm, Ly_nm, Lz_nm, material_name=mat_choice)
+    st.pyplot(fig)
+    st.markdown("*(3D Freedom, 0D Confinement)*")
+with col2:
+    st.subheader("Step 2: Quantum Well")
+    fig = create_confinement_plot("Quantum Well (2D Freedom)", emitted_hex, dim_choice == "Quantum Well (2D Freedom)", Lx_nm, Ly_nm, Lz_nm, material_name=mat_choice)
+    st.pyplot(fig)
+    st.markdown("*(2D Freedom, 1D Confinement)*")
+with col3:
+    st.subheader("Step 3: Quantum Wire")
+    fig = create_confinement_plot("Quantum Wire (1D Freedom)", emitted_hex, dim_choice == "Quantum Wire (1D Freedom)", Lx_nm, Ly_nm, Lz_nm, material_name=mat_choice)
+    st.pyplot(fig)
+    st.markdown("*(1D Freedom, 2D Confinement)*")
+with col4:
+    st.subheader("Step 4: Quantum Dot")
+    fig = create_confinement_plot("Quantum Dot (0D Freedom)", emitted_hex, dim_choice == "Quantum Dot (0D Freedom)", Lx_nm, Ly_nm, Lz_nm, material_name=mat_choice)
+    st.pyplot(fig)
+    st.markdown("*(0D Freedom, 3D Confinement)*")
+
+st.markdown("---")
+
+# --- Dynamic Simulation Results (The "Effect") ---
+st.header(f"⚡ Simulation Results for: {dim_choice}")
+
+# --- 1. PRE-GENERATE BOTH PLOTS ---
+# --- *** UPDATED: Generate Band Gap Diagram *** ---
+fig_band_gap = plot_band_gap_diagram(E_gap_optical, E_gap_electronic, E_binding, E_bulk_gap, E_conf_e, E_conf_h, emitted_hex)
+
+# --- Generate Electronic Structure Plot (fig_dos) ---
+fig_dos = plot_electronic_structure(dim_choice, electron_levels, L_nm_avg) # DOS uses electron levels & avg size
+
+
+# --- 2. DRAW COLUMNS AND PLOTS ---
+res_col1, res_col2 = st.columns([1, 1.5]) 
+
+with res_col1:
+    st.subheader("Optical Band Gap")
+    # --- *** UPDATED: Display Band Gap Plot *** ---
+    st.pyplot(fig_band_gap)
+    
+    st.write(f"Simulating a **{mat_choice.split(' (')[0]}** particle:")
+    
+    if dim_choice == "Quantum Dot (0D Freedom)":
+        st.write(f"**Lx:** `{Lx_nm:.1f} nm` | **Ly:** `{Ly_nm:.1f} nm` | **Lz:** `{Lz_nm:.1f} nm`")
+    elif dim_choice != "Bulk (3D Freedom)":
+        st.write(f"**Confinement Size (L):** `{L_nm_avg:.1f} nm`")
+    
+    st.metric(label="Optical Band Gap (E_opt)", value=f"{E_gap_optical:.3f} eV")
+    st.metric(label=f"Emission Wavelength (λ)", value=f"{wavelength_nm:.1f} nm ({color_name})")
+    
+    # --- *** UPDATED: Expander details *** ---
+    with st.expander("See Calculation Details"):
+        st.markdown(r"""
+        $E_{g\_elec} = E_{g\_bulk} + E_{conf\_e} + E_{conf\_h}$
+        
+        $E_{g\_opt} = E_{g\_elec} - E_{binding}$
+        """)
+        st.write(f"**Bulk Band Gap ($E_{{g\_bulk}}$):** {E_bulk_gap:.3f} eV")
+        st.write(f"**Electron Confinement ($E_{{conf\_e}}$):** {E_conf_e:.3f} eV")
+        st.write(f"**Hole Confinement ($E_{{conf\_h}}$):** {E_conf_h:.3f} eV")
+        st.write(f"**Electronic Gap ($E_{{g\_elec}}$):** {E_gap_electronic:.3f} eV")
+        st.write(f"**Exciton Binding ($E_{{binding}}$):** {E_binding:.3f} eV")
+        st.write(f"**Optical Gap ($E_{{g\_opt}}$):** {E_gap_electronic:.3f} - {E_binding:.3f} = **{E_gap_optical:.3f} eV**")
+
+with res_col2:
+    st.subheader("Electron Conduction Band Structure (CO402.2)")
+    st.pyplot(fig_dos)
+    
+    # --- Text section ---
+    if dim_choice == "Bulk (3D Freedom)":
+        st.write(r"For a **Bulk** material, the Density of States (DOS) is a **continuous curve** ($g(E) \propto \sqrt{E}$).")
+    elif dim_choice == "Quantum Well (2D Freedom)":
+        st.write(r"For a **Quantum Well**, the DOS is a **staircase**.")
+    elif dim_choice == "Quantum Wire (1D Freedom)":
+        st.write(r"For a **Quantum Wire**, the DOS shows **spikes** ($g(E) \propto 1/\sqrt{E-E_n}$) at each sub-band.")
+    else: 
+        st.write(r"For a **Quantum Dot**, the DOS is a series of **delta functions** (spikes) at discrete energy levels.")
+        if Lx_nm != Ly_nm or Ly_nm != Lz_nm or Lx_nm != Lz_nm:
+            st.info("💡 **Anisotropy Effect:** Notice how the electronic energy levels ($n=(1,1,2)$ vs $n=(1,2,1)$) are no longer 'degenerate' (equal). Changing the shape from a cube to a rod breaks this symmetry!")
