@@ -141,7 +141,7 @@ def create_confinement_plot(dimensionality, color_hex, is_selected, material_nam
                   color=color, arrow_length_ratio=0.3, linewidth=3)
     
     object_color = color_hex if color_hex is not None else DEFAULT_OBJ_COLOR
-    object_alpha = 0.8 if dimensionality != "Bulk (3D Freedom)" else 0.3
+    object_alpha = 0.4 if dimensionality != "Bulk (3D Freedom)" else 0.3
 
     if dimensionality == "Bulk (3D Freedom)":
         # Draw a large transparent block
@@ -293,7 +293,7 @@ def coulomb_blockade_iv(C_total_f, T_K, Vg, Vbias_array):
     return np.array(I), Ec
 
 # ---------------------- HEADER -----------------------
-st.title("🏆 Quantum Confinement & Nanoscale Simulator")
+st.title("Quantum Confinement & Nanoscale Electonic Simulator")
 
 # ---------------------- SIDEBAR -----------------------
 st.sidebar.header("Simulation Controls")
@@ -309,7 +309,7 @@ mat_choice = st.sidebar.selectbox("Material", list(MATERIALS.keys()))
 # Size Slider
 st.sidebar.markdown("---")
 # Focusing on 1-25nm where the quantum effects are visible
-L_MIN, L_MAX = 1.0, 25.0
+L_MIN, L_MAX = 1.0, 60.0
 L_nm = st.sidebar.slider("Size L (nm)", L_MIN, L_MAX, 4.0, 0.1)
 
 # SA/V Controls
